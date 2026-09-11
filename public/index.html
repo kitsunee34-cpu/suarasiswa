@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ms">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SuaraSiswa — Suara anda. Perubahan sekolah.</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="nav">
+  <div class="brand">SuaraSiswa</div>
+  <div class="nav-actions">
+    <button class="link-btn" onclick="showPage('how')">Cara ia berfungsi</button>
+    <button class="outline-btn" onclick="showPage('login')">Log masuk</button>
+  </div>
+</header>
+
+<main>
+  <section id="home" class="hero page">
+    <div class="hero-copy">
+      <div class="eyebrow">Platform suara pelajar</div>
+      <h1>Suara anda.<br><em>Perubahan sekolah.</em></h1>
+      <p>SuaraSiswa membantu pelajar menyampaikan pendapat, berkongsi keadaan diri dan membuat laporan secara lebih mudah, teratur dan selamat.</p>
+      <div class="cta-row">
+        <button class="primary" onclick="showPage('login')">Mula sebagai Pelajar</button>
+        <button class="text-link" onclick="showPage('how')">Lihat cara ia berfungsi</button>
+      </div>
+      <div class="chips">
+        <span>Sulit</span><span>Berpusatkan pelajar</span><span>Akses kakitangan terkawal</span>
+      </div>
+    </div>
+    <div class="hero-cards">
+      <div class="floating-card card-a"><small>💬 Pendapat Sekolah</small><strong>"Tandas tingkat 2 perlukan penyelenggaraan segera..."</strong></div>
+      <div class="floating-card card-b"><small>🍽️ Dewan Makan</small><strong>Nasi ayam hari ini</strong><div class="stars">★★★★☆</div></div>
+      <div class="floating-card card-c"><small>💙 Luahan Perasaan</small><strong>"Hari ini saya rasa lega selepas..."</strong></div>
+    </div>
+  </section>
+
+  <section id="how" class="page hidden narrow">
+    <button class="back" onclick="showPage('home')">← Kembali</button>
+    <div class="section-head"><div class="eyebrow">Mudah dan terkawal</div><h2>Satu tempat untuk suara pelajar.</h2></div>
+    <div class="steps">
+      <div><b>01</b><h3>Pelajar log masuk</h3><p>Akaun pelajar hanya boleh dibuat oleh admin atau kaunselor.</p></div>
+      <div><b>02</b><h3>Hantar laporan</h3><p>Pilih kategori, tulis perkara yang ingin disampaikan dan hantar.</p></div>
+      <div><b>03</b><h3>Kakitangan semak</h3><p>Laporan disimpan dalam kawasan terkawal yang hanya boleh dicapai oleh admin.</p></div>
+    </div>
+  </section>
+
+  <section id="login" class="page hidden narrow">
+    <button class="back" onclick="showPage('home')">← Kembali</button>
+    <div class="auth-grid">
+      <div class="auth-card">
+        <span class="icon">🎓</span><h2>Log masuk Pelajar</h2>
+        <p>Hantar suara, cadangan dan laporan anda.</p>
+        <form onsubmit="login(event,'student')">
+          <label>ID / Username<input id="student-user" required></label>
+          <label>Password<input id="student-pass" type="password" required></label>
+          <button class="primary full">Log Masuk</button>
+        </form>
+      </div>
+      <div class="auth-card admin-card">
+        <span class="icon">🛡️</span><h2>Admin / Kaunselor</h2>
+        <p>Ruang terkawal untuk mengurus pelajar dan laporan.</p>
+        <form onsubmit="login(event,'admin')">
+          <label>Username<input id="admin-user" required></label>
+          <label>Password<input id="admin-pass" type="password" required></label>
+          <button class="dark full">Log Masuk Admin</button>
+        </form>
+      </div>
+    </div>
+    <div id="setup-box" class="setup-box hidden">
+      <h3>First-time setup</h3>
+      <p>Create the first admin account. This appears only when the database has no admin.</p>
+      <form onsubmit="setupAdmin(event)">
+        <label>Admin name<input id="setup-name" required></label>
+        <label>Username<input id="setup-user" required></label>
+        <label>Password (10+ characters)<input id="setup-pass" type="password" minlength="10" required></label>
+        <button class="dark full">Create Admin</button>
+      </form>
+    </div>
+  </section>
+
+  <section id="student" class="page hidden narrow">
+    <div class="dashboard-top"><div><div class="eyebrow">Ruang pelajar</div><h2 id="student-welcome">Selamat datang 👋</h2></div><button class="outline-btn" onclick="logout()">Log keluar</button></div>
+    <div class="report-layout">
+      <form class="panel" onsubmit="submitReport(event)">
+        <h3>Sampaikan sesuatu</h3>
+        <label>Kategori<select id="report-category" required>
+          <option>Dewan Makan</option><option>Luahan Perasaan</option><option>Cadangan</option><option>Laporan Pelajar</option><option>Isu Sekolah</option>
+        </select></label>
+        <label>Tajuk<input id="report-title" maxlength="160" required placeholder="Contoh: Lampu tandas rosak"></label>
+        <label>Perkara yang ingin disampaikan<textarea id="report-description" maxlength="5000" required placeholder="Tulis dengan jelas apa yang berlaku..."></textarea></label>
+        <button class="primary full">Hantar Laporan</button>
+        <div class="privacy-note">🔒 Laporan anda tidak dipaparkan kepada pelajar lain.</div>
+      </form>
+      <div class="panel"><h3>Laporan saya</h3><div id="my-reports" class="report-list"></div></div>
+    </div>
+  </section>
+
+  <section id="admin" class="page hidden narrow">
+    <div class="dashboard-top"><div><div class="eyebrow">Kawasan terkawal</div><h2>Admin Dashboard</h2></div><button class="outline-btn" onclick="logout()">Log keluar</button></div>
+    <div class="stats"><div><strong id="stat-total">0</strong><span>Jumlah laporan</span></div><div><strong id="stat-pending">0</strong><span>Perlu tindakan</span></div><div><strong id="stat-resolved">0</strong><span>Selesai</span></div></div>
+    <div class="admin-grid">
+      <div class="panel"><div class="panel-title"><h3>Laporan pelajar</h3><button class="text-link" onclick="loadAdmin()">Refresh</button></div><div id="admin-reports" class="report-list"></div></div>
+      <div class="panel"><h3>Daftar pelajar</h3>
+        <form onsubmit="createStudent(event)">
+          <label>Nama<input id="new-name" required></label>
+          <label>Username / ID<input id="new-user" required></label>
+          <label>Kelas<input id="new-class"></label>
+          <label>Password sementara (10+)<input id="new-pass" minlength="10" required></label>
+          <button class="dark full">Daftar Pelajar</button>
+        </form>
+        <hr><h3>Senarai pelajar</h3><div id="students" class="student-list"></div>
+      </div>
+    </div>
+  </section>
+</main>
+<div id="toast" class="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>
