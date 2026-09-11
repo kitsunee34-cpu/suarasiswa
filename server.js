@@ -42,6 +42,7 @@ CREATE INDEX IF NOT EXISTS idx_reports_student ON reports(student_id);
 CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status);
 `);
 
+app.set("trust proxy", 1);
 app.use(helmet({
   contentSecurityPolicy: false
 }));
