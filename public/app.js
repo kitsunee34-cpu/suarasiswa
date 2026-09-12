@@ -40,10 +40,49 @@ async function login(e,role){
 function enterDashboard(user){
   if(user.role==="student"){
     $("student-welcome").textContent=`Selamat datang, ${user.name} 👋`;
-    showPage("student"); loadMyReports();
+    showPage("student"); loadMyReports(); loadMyAttendance();
   }else{
     showPage("admin"); loadAdmin();
   }
+}
+function todayStr(){return new Date().toISOString().slice(0,10)}
+async function loadAttendance(){
+  try{
+    if(!$("attendance-date").value) $("attendance-date").value=todayStr();
+    const date=$("attendance-date").value;
+    const d=await api("/api/admin/attendance/"+date);
+    $("attendance-list").innerHTML=d.students.length?d.students.map(s=>`
+      <div class="student-row">
+        <span><b>${escapeHtml(s.name)}</b><br>${escapeHtml(s.username)} · ${escapeHtml(s.class_name||"")}</span>
+        <select id="att-${s.id}">
+          <option value="Hadir" ${s.status==="Hadir"?"selected":""}>Hadir</option>
+          <option value="Tidak Hadir" ${s.status==="Tidak Hadir"?"selected":""}>Tidak Hadir</option>
+          <option value="Lewat" ${s.status==="Lewat"?"selected":""}>Lewat</option>
+          <option value="Cuti" ${s.status==="Cuti"?"selected":""}>Cuti</option>
+        </select>
+      </div>`).join(""):"<p class='privacy-note'>Tiada pelajar aktif.</p>";
+  }catch(e){toast(e.message)}
+}
+async function saveAttendance(){
+  try{
+    const date=$("attendance-date").value||todayStr();
+    const selects=[...document.querySelectorAll("select[id^='att-']")];
+    const records=selects.map(el=>({studentId:Number(el.id.replace("att-","")),status:el.value}));
+    if(!records.length){toast("Tiada pelajar untuk disimpan.");return}
+    await api("/api/admin/attendance",{method:"POST",body:JSON.stringify({date,records})});
+    toast("Kehadiran disimpan.");
+  }catch(e){toast(e.message)}
+}
+async function loadMyAttendance(){
+  try{
+    const d=await api("/api/attendance/my");
+    $("att-percent").textContent=d.summary.percent+"%";
+    $("att-hadir").textContent=d.summary.hadir;
+    $("att-tak-hadir").textContent=d.summary.takHadir;
+    $("my-attendance").innerHTML=d.records.length?d.records.map(r=>`
+      <article class="report-item"><span class="badge ${r.status.replace(" ","")}">${r.status}</span>
+      <div class="report-meta">${r.date}</div></article>`).join(""):"<p class='privacy-note'>Tiada rekod kehadiran.</p>";
+  }catch(e){}
 }
 async function logout(){await api("/api/auth/logout",{method:"POST"});showPage("home")}
 async function submitReport(e){
@@ -88,6 +127,7 @@ async function loadAdmin(){
       <div class="student-row"><span><b>${escapeHtml(x.name)}</b><br>${escapeHtml(x.username)} · ${escapeHtml(x.class_name||"")}</span>
       <button class="outline-btn" onclick="toggleStudent(${x.id},${!x.active})">${x.active?"Disable":"Enable"}</button></div>`).join("")
       :"<p class='privacy-note'>Belum ada pelajar.</p>";
+    loadAttendance();
   }catch(e){toast(e.message)}
 }
 async function updateReport(id){

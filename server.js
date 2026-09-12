@@ -40,6 +40,20 @@ CREATE TABLE IF NOT EXISTS reports (
 
 CREATE INDEX IF NOT EXISTS idx_reports_student ON reports(student_id);
 CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status);
+
+CREATE TABLE IF NOT EXISTS attendance (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id INTEGER NOT NULL,
+  date TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('Hadir','Tidak Hadir','Lewat','Cuti')),
+  marked_by INTEGER,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(student_id, date),
+  FOREIGN KEY(student_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date);
+CREATE INDEX IF NOT EXISTS idx_attendance_student ON attendance(student_id);
 `);
 
 app.set("trust proxy", 1);
@@ -221,6 +235,66 @@ app.patch("/api/admin/students/:id/status", requireRole("admin"), (req, res) => 
     .run(active, req.params.id);
   if (!result.changes) return res.status(404).json({ error: "Student not found." });
   res.json({ ok: true });
+});
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const ATTENDANCE_STATUSES = ["Hadir", "Tidak Hadir", "Lewat", "Cuti"];
+
+app.get("/api/admin/attendance/:date", requireRole("admin"), (req, res) => {
+  const date = clean(req.params.date, 10);
+  if (!DATE_RE.test(date)) return res.status(400).json({ error: "Invalid date." });
+
+  const rows = db.prepare(`
+    SELECT u.id, u.username, u.name, u.class_name, a.status
+    FROM users u
+    LEFT JOIN attendance a ON a.student_id = u.id AND a.date = ?
+    WHERE u.role='student' AND u.active=1
+    ORDER BY u.class_name COLLATE NOCASE, u.name COLLATE NOCASE
+  `).all(date);
+
+  res.json({ date, students: rows });
+});
+
+app.post("/api/admin/attendance", requireRole("admin"), (req, res) => {
+  const date = clean(req.body.date, 10);
+  const records = Array.isArray(req.body.records) ? req.body.records : [];
+  if (!DATE_RE.test(date)) return res.status(400).json({ error: "Invalid date." });
+  if (!records.length) return res.status(400).json({ error: "No attendance records provided." });
+
+  for (const r of records) {
+    if (!Number.isInteger(r.studentId) || !ATTENDANCE_STATUSES.includes(r.status)) {
+      return res.status(400).json({ error: "Invalid attendance record." });
+    }
+  }
+
+  const upsert = db.prepare(`
+    INSERT INTO attendance (student_id, date, status, marked_by)
+    VALUES (?,?,?,?)
+    ON CONFLICT(student_id, date) DO UPDATE SET
+      status=excluded.status, marked_by=excluded.marked_by, updated_at=CURRENT_TIMESTAMP
+  `);
+  const runAll = db.transaction((items) => {
+    for (const r of items) upsert.run(r.studentId, date, r.status, req.session.user.id);
+  });
+  runAll(records);
+
+  res.json({ ok: true, count: records.length });
+});
+
+app.get("/api/attendance/my", requireRole("student"), (req, res) => {
+  const records = db.prepare(`
+    SELECT date, status FROM attendance WHERE student_id=? ORDER BY date DESC LIMIT 90
+  `).all(req.session.user.id);
+
+  const counts = { Hadir: 0, "Tidak Hadir": 0, Lewat: 0, Cuti: 0 };
+  for (const r of records) counts[r.status] = (counts[r.status] || 0) + 1;
+  const marked = records.length;
+  const percent = marked ? Math.round((counts.Hadir / marked) * 100) : 0;
+
+  res.json({
+    records,
+    summary: { percent, hadir: counts.Hadir, takHadir: counts["Tidak Hadir"], lewat: counts.Lewat, cuti: counts.Cuti }
+  });
 });
 
 app.get("*", (req, res) => {

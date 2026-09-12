@@ -95,6 +95,15 @@
       </form>
       <div class="panel"><h3>Laporan saya</h3><div id="my-reports" class="report-list"></div></div>
     </div>
+    <div class="panel" style="margin-top:20px">
+      <h3>Kehadiran saya</h3>
+      <div class="stats">
+        <div><strong id="att-percent">0%</strong><span>Kehadiran</span></div>
+        <div><strong id="att-hadir">0</strong><span>Hadir</span></div>
+        <div><strong id="att-tak-hadir">0</strong><span>Tidak Hadir</span></div>
+      </div>
+      <div id="my-attendance" class="report-list"></div>
+    </div>
   </section>
 
   <section id="admin" class="page hidden narrow">
@@ -112,6 +121,14 @@
         </form>
         <hr><h3>Senarai pelajar</h3><div id="students" class="student-list"></div>
       </div>
+    </div>
+    <div class="panel" style="margin-top:20px">
+      <div class="panel-title">
+        <h3>Kehadiran Pelajar</h3>
+        <input type="date" id="attendance-date" onchange="loadAttendance()">
+      </div>
+      <div id="attendance-list" class="report-list"></div>
+      <button class="dark full" style="margin-top:14px" onclick="saveAttendance()">Simpan Kehadiran</button>
     </div>
   </section>
 </main>
