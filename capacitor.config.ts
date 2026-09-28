@@ -2,7 +2,7 @@ import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
   appId: 'com.yourschool.suarasiswa',
-  appName: 'SuaraSiswa',
+  appName: 'SuaraSahut',
   webDir: 'public',
   server: {
     // IMPORTANT: replace this with your real deployed HTTPS URL

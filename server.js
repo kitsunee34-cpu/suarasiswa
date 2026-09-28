@@ -1,4 +1,3 @@
-require('dotenv').config();
 const express = require("express");
 const session = require("express-session");
 const pgSession = require("connect-pg-simple")(session);
@@ -15,6 +14,13 @@ const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(48).toSt
 if (!process.env.DATABASE_URL) {
   console.error("Missing DATABASE_URL environment variable. Set it to your Supabase connection string.");
   process.exit(1);
+}
+
+// Shared secret the NFC reader device (ESP32) sends to prove it's allowed to log taps.
+// Set this in your environment; generate a long random value, don't hardcode it.
+const NFC_DEVICE_KEY = process.env.NFC_DEVICE_KEY || "";
+if (!NFC_DEVICE_KEY) {
+  console.warn("Warning: NFC_DEVICE_KEY not set. /api/nfc/tap will reject all requests until it is set.");
 }
 
 const pool = new Pool({
@@ -62,6 +68,18 @@ async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date);
     CREATE INDEX IF NOT EXISTS idx_attendance_student ON attendance(student_id);
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS nfc_uid TEXT UNIQUE;
+
+    CREATE TABLE IF NOT EXISTS counseling_visits (
+      id SERIAL PRIMARY KEY,
+      student_id INTEGER NOT NULL REFERENCES users(id),
+      device_id TEXT,
+      note TEXT,
+      tapped_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_counseling_visits_student ON counseling_visits(student_id);
+    CREATE INDEX IF NOT EXISTS idx_counseling_visits_tapped_at ON counseling_visits(tapped_at);
   `);
 }
 
@@ -325,6 +343,78 @@ app.get("/api/attendance/my", requireRole("student"), asyncRoute(async (req, res
   });
 }));
 
+// Admin: assign / change the NFC card UID linked to a student.
+app.post("/api/admin/students/:id/nfc", requireRole("admin"), asyncRoute(async (req, res) => {
+  const uid = clean(req.body.uid, 64).toUpperCase();
+  if (!uid) return res.status(400).json({ error: "Card UID is required." });
+
+  try {
+    const result = await pool.query(
+      "UPDATE users SET nfc_uid=$1 WHERE id=$2 AND role='student' RETURNING id, name",
+      [uid, req.params.id]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: "Student not found." });
+    res.json({ ok: true, student: result.rows[0] });
+  } catch {
+    res.status(409).json({ error: "That card is already linked to another student." });
+  }
+}));
+
+// Admin: remove a card from a student (e.g. lost card).
+app.delete("/api/admin/students/:id/nfc", requireRole("admin"), asyncRoute(async (req, res) => {
+  const result = await pool.query(
+    "UPDATE users SET nfc_uid=NULL WHERE id=$1 AND role='student' RETURNING id",
+    [req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: "Student not found." });
+  res.json({ ok: true });
+}));
+
+// Device endpoint: the ESP32/RC522 reader at the counseling room calls this on every tap.
+// Auth is a shared device key (header), NOT a student/admin session — the device can't log in.
+app.post("/api/nfc/tap", asyncRoute(async (req, res) => {
+  const deviceKey = req.get("X-Device-Key") || "";
+  if (!NFC_DEVICE_KEY || deviceKey !== NFC_DEVICE_KEY) {
+    return res.status(401).json({ error: "Invalid device key." });
+  }
+
+  const uid = clean(req.body.uid, 64).toUpperCase();
+  const deviceId = clean(req.body.deviceId, 64);
+  if (!uid) return res.status(400).json({ error: "Missing card UID." });
+
+  const student = (await pool.query(
+    "SELECT id, name, class_name FROM users WHERE nfc_uid=$1 AND role='student' AND active=1",
+    [uid]
+  )).rows[0];
+
+  if (!student) {
+    // Card not recognized — still return 200 so the reader can show "unknown card" without erroring.
+    return res.json({ recognized: false });
+  }
+
+  await pool.query(
+    "INSERT INTO counseling_visits (student_id, device_id) VALUES ($1,$2)",
+    [student.id, deviceId || null]
+  );
+
+  res.json({ recognized: true, student: { name: student.name, className: student.class_name } });
+}));
+
+// Admin: view counseling room visit log for a given date (defaults to today).
+app.get("/api/admin/counseling/visits", requireRole("admin"), asyncRoute(async (req, res) => {
+  const date = DATE_RE.test(req.query.date || "") ? req.query.date : new Date().toISOString().slice(0, 10);
+
+  const r = await pool.query(`
+    SELECT cv.id, cv.tapped_at, cv.device_id, u.id AS student_id, u.name, u.class_name
+    FROM counseling_visits cv
+    JOIN users u ON u.id = cv.student_id
+    WHERE cv.tapped_at::date = $1::date
+    ORDER BY cv.tapped_at DESC
+  `, [date]);
+
+  res.json({ date, visits: r.rows });
+}));
+
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
@@ -337,7 +427,7 @@ app.use((err, req, res, next) => {
 initDb()
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`SuaraSiswa running at http://localhost:${PORT}`);
+      console.log(`SuaraSahut running at http://localhost:${PORT}`);
     });
   })
   .catch((e) => {
