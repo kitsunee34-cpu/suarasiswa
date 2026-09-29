@@ -40,48 +40,86 @@ async function login(e,role){
 function enterDashboard(user){
   if(user.role==="student"){
     $("student-welcome").textContent=`Selamat datang, ${user.name} 👋`;
-    showPage("student"); loadMyReports(); loadMyAttendance();
+    showPage("student"); loadMyReports(); loadMyVisits();
   }else{
     showPage("admin"); loadAdmin();
   }
 }
-function todayStr(){return new Date().toISOString().slice(0,10)}
-async function loadAttendance(){
+const TZ="Asia/Kuala_Lumpur";
+function todayStr(){return new Date().toLocaleDateString("en-CA",{timeZone:TZ})}
+function nowTimeStr(){return new Date().toLocaleTimeString("en-GB",{timeZone:TZ,hour:"2-digit",minute:"2-digit"})}
+function fmtTime(t){return new Date(t).toLocaleTimeString("ms-MY",{timeZone:TZ,hour:"2-digit",minute:"2-digit"})}
+function fmtDateTime(t){return new Date(t).toLocaleString("ms-MY",{timeZone:TZ,dateStyle:"medium",timeStyle:"short"})}
+
+async function loadVisits(){
   try{
-    if(!$("attendance-date").value) $("attendance-date").value=todayStr();
-    const date=$("attendance-date").value;
-    const d=await api("/api/admin/attendance/"+date);
-    $("attendance-list").innerHTML=d.students.length?d.students.map(s=>`
-      <div class="student-row">
-        <span><b>${escapeHtml(s.name)}</b><br>${escapeHtml(s.username)} · ${escapeHtml(s.class_name||"")}</span>
-        <select id="att-${s.id}">
-          <option value="Hadir" ${s.status==="Hadir"?"selected":""}>Hadir</option>
-          <option value="Tidak Hadir" ${s.status==="Tidak Hadir"?"selected":""}>Tidak Hadir</option>
-          <option value="Lewat" ${s.status==="Lewat"?"selected":""}>Lewat</option>
-          <option value="Cuti" ${s.status==="Cuti"?"selected":""}>Cuti</option>
-        </select>
-      </div>`).join(""):"<p class='privacy-note'>Tiada pelajar aktif.</p>";
+    if(!$("visit-date").value) $("visit-date").value=todayStr();
+    if(!$("manual-time").value) $("manual-time").value=nowTimeStr();
+    const d=await api("/api/admin/counseling/visits?date="+$("visit-date").value);
+    $("visit-count").textContent=d.visits.length;
+    $("visit-unique").textContent=new Set(d.visits.map(v=>v.student_id)).size;
+    $("visit-list").innerHTML=d.visits.length?d.visits.map(v=>`
+      <article class="report-item admin-report">
+        <div><span class="badge Hadir">${fmtTime(v.tapped_at)}</span>${v.device_id==="manual"?' <span class="badge">Manual</span>':""}
+        <h4>${escapeHtml(v.name)}</h4>
+        <div class="report-meta">${escapeHtml(v.class_name||"")}</div></div>
+        <textarea id="vnote-${v.id}" placeholder="Catatan kaunselor (pilihan)">${escapeHtml(v.note||"")}</textarea>
+        <div style="display:flex;gap:8px">
+          <button class="dark" onclick="saveVisitNote(${v.id})">Simpan catatan</button>
+          <button class="outline-btn" onclick="deleteVisit(${v.id})">Padam</button>
+        </div>
+      </article>`).join(""):"<p class='privacy-note'>Tiada pelajar hadir ke UBK pada tarikh ini.</p>";
   }catch(e){toast(e.message)}
 }
-async function saveAttendance(){
+async function saveVisitNote(id){
   try{
-    const date=$("attendance-date").value||todayStr();
-    const selects=[...document.querySelectorAll("select[id^='att-']")];
-    const records=selects.map(el=>({studentId:Number(el.id.replace("att-","")),status:el.value}));
-    if(!records.length){toast("Tiada pelajar untuk disimpan.");return}
-    await api("/api/admin/attendance",{method:"POST",body:JSON.stringify({date,records})});
-    toast("Kehadiran disimpan.");
+    await api("/api/admin/counseling/visits/"+id,{method:"PATCH",body:JSON.stringify({note:$("vnote-"+id).value})});
+    toast("Catatan disimpan.");
   }catch(e){toast(e.message)}
 }
-async function loadMyAttendance(){
+async function deleteVisit(id){
+  if(!confirm("Padam rekod lawatan ini?")) return;
   try{
-    const d=await api("/api/attendance/my");
-    $("att-percent").textContent=d.summary.percent+"%";
-    $("att-hadir").textContent=d.summary.hadir;
-    $("att-tak-hadir").textContent=d.summary.takHadir;
-    $("my-attendance").innerHTML=d.records.length?d.records.map(r=>`
-      <article class="report-item"><span class="badge ${r.status.replace(" ","")}">${r.status}</span>
-      <div class="report-meta">${r.date}</div></article>`).join(""):"<p class='privacy-note'>Tiada rekod kehadiran.</p>";
+    await api("/api/admin/counseling/visits/"+id,{method:"DELETE"});
+    toast("Rekod dipadam.");loadVisits();
+  }catch(e){toast(e.message)}
+}
+async function addVisit(e){
+  e.preventDefault();
+  try{
+    await api("/api/admin/counseling/visits",{method:"POST",body:JSON.stringify({
+      studentId:Number($("manual-student").value),
+      date:$("visit-date").value||todayStr(),
+      time:$("manual-time").value,
+      note:$("manual-note").value
+    })});
+    $("manual-note").value="";
+    toast("Lawatan ditambah.");loadVisits();
+  }catch(e){toast(e.message)}
+}
+async function setCard(id){
+  const uid=prompt("Masukkan UID kad NFC pelajar (contoh: 04A1B2C3):");
+  if(uid===null||!uid.trim()) return;
+  try{
+    await api("/api/admin/students/"+id+"/nfc",{method:"POST",body:JSON.stringify({uid})});
+    toast("Kad dipautkan.");loadAdmin();
+  }catch(e){toast(e.message)}
+}
+async function removeCard(id){
+  if(!confirm("Buang kad daripada pelajar ini?")) return;
+  try{
+    await api("/api/admin/students/"+id+"/nfc",{method:"DELETE"});
+    toast("Kad dibuang.");loadAdmin();
+  }catch(e){toast(e.message)}
+}
+async function loadMyVisits(){
+  try{
+    const d=await api("/api/visits/my");
+    $("visit-total").textContent=d.summary.total;
+    $("visit-month").textContent=d.summary.thisMonth;
+    $("my-visits").innerHTML=d.visits.length?d.visits.map(v=>`
+      <article class="report-item"><span class="badge Hadir">Hadir ke UBK</span>
+      <div class="report-meta">${fmtDateTime(v.tapped_at)}</div></article>`).join(""):"<p class='privacy-note'>Belum ada rekod lawatan ke UBK.</p>";
   }catch(e){}
 }
 async function logout(){await api("/api/auth/logout",{method:"POST"});showPage("home")}
@@ -125,9 +163,12 @@ async function loadAdmin(){
       </article>`).join(""):"<p class='privacy-note'>Tiada laporan.</p>";
     $("students").innerHTML=s.students.length?s.students.map(x=>`
       <div class="student-row"><span><b>${escapeHtml(x.name)}</b><br>${escapeHtml(x.username)} · ${escapeHtml(x.class_name||"")}</span>
-      <button class="outline-btn" onclick="toggleStudent(${x.id},${!x.active})">${x.active?"Disable":"Enable"}</button></div>`).join("")
+      <span style="display:flex;gap:6px;align-items:flex-start;flex-wrap:wrap;justify-content:flex-end">
+        ${x.nfc_uid?`<button class="outline-btn" title="Buang kad ${escapeHtml(x.nfc_uid)}" onclick="removeCard(${x.id})">💳 ${escapeHtml(x.nfc_uid)} ✕</button>`:`<button class="outline-btn" onclick="setCard(${x.id})">+ Kad NFC</button>`}
+        <button class="outline-btn" onclick="toggleStudent(${x.id},${!x.active})">${x.active?"Disable":"Enable"}</button></span></div>`).join("")
       :"<p class='privacy-note'>Belum ada pelajar.</p>";
-    loadAttendance();
+    $("manual-student").innerHTML=s.students.filter(x=>x.active).map(x=>`<option value="${x.id}">${escapeHtml(x.name)}${x.class_name?" ("+escapeHtml(x.class_name)+")":""}</option>`).join("");
+    loadVisits();
   }catch(e){toast(e.message)}
 }
 async function updateReport(id){
