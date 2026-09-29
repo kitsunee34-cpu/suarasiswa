@@ -1,0 +1,425 @@
+const express = require("express");
+const session = require("express-session");
+const pgSession = require("connect-pg-simple")(session);
+const helmet = require("helmet");
+const bcrypt = require("bcryptjs");
+const { Pool } = require("pg");
+const path = require("path");
+const crypto = require("crypto");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(48).toString("hex");
+
+if (!process.env.DATABASE_URL) {
+  console.error("Missing DATABASE_URL environment variable. Set it to your Supabase connection string.");
+  process.exit(1);
+}
+
+// Shared secret the NFC reader device (ESP32) sends to prove it's allowed to log taps.
+// Set this in your environment; generate a long random value, don't hardcode it.
+const NFC_DEVICE_KEY = process.env.NFC_DEVICE_KEY || "";
+if (!NFC_DEVICE_KEY) {
+  console.warn("Warning: NFC_DEVICE_KEY not set. /api/nfc/tap will reject all requests until it is set.");
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      class_name TEXT,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('student','admin')),
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS reports (
+      id SERIAL PRIMARY KEY,
+      student_id INTEGER NOT NULL REFERENCES users(id),
+      category TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'Pending'
+        CHECK(status IN ('Pending','In Review','Resolved','Closed')),
+      admin_response TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_reports_student ON reports(student_id);
+    CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status);
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS nfc_uid TEXT UNIQUE;
+
+    CREATE TABLE IF NOT EXISTS counseling_visits (
+      id SERIAL PRIMARY KEY,
+      student_id INTEGER NOT NULL REFERENCES users(id),
+      device_id TEXT,
+      note TEXT,
+      tapped_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_counseling_visits_student ON counseling_visits(student_id);
+    CREATE INDEX IF NOT EXISTS idx_counseling_visits_tapped_at ON counseling_visits(tapped_at);
+  `);
+}
+
+app.set("trust proxy", 1);
+app.use(helmet({
+  contentSecurityPolicy: false
+}));
+app.use(express.json({ limit: "100kb" }));
+app.use(express.urlencoded({ extended: false }));
+app.use(session({
+  store: new pgSession({ pool, tableName: "session", createTableIfMissing: true }),
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 1000 * 60 * 60 * 4
+  }
+}));
+app.use(express.static(path.join(__dirname, "public")));
+
+function requireAuth(req, res, next) {
+  if (!req.session.user) return res.status(401).json({ error: "Not authenticated" });
+  next();
+}
+function requireRole(role) {
+  return (req, res, next) => {
+    if (!req.session.user || req.session.user.role !== role) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+    next();
+  };
+}
+function clean(v, max = 5000) {
+  return String(v ?? "").trim().slice(0, max);
+}
+function asyncRoute(fn) {
+  return (req, res, next) => fn(req, res, next).catch(next);
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const TZ = "Asia/Kuala_Lumpur";
+function todayKL() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+}
+
+app.get("/api/setup/status", asyncRoute(async (req, res) => {
+  const r = await pool.query("SELECT COUNT(*)::int AS count FROM users WHERE role='admin'");
+  res.json({ needsSetup: r.rows[0].count === 0 });
+}));
+
+app.post("/api/setup/admin", asyncRoute(async (req, res) => {
+  const adminCount = (await pool.query("SELECT COUNT(*)::int AS count FROM users WHERE role='admin'")).rows[0].count;
+  if (adminCount > 0) return res.status(409).json({ error: "Admin setup is already completed." });
+
+  const username = clean(req.body.username, 80);
+  const name = clean(req.body.name, 120);
+  const password = String(req.body.password || "");
+  if (!username || !name || password.length < 10) {
+    return res.status(400).json({ error: "Name, username and a password of at least 10 characters are required." });
+  }
+
+  const hash = await bcrypt.hash(password, 12);
+  const result = await pool.query(
+    "INSERT INTO users (username,name,password_hash,role) VALUES ($1,$2,$3,'admin') RETURNING id",
+    [username, name, hash]
+  );
+
+  req.session.user = { id: result.rows[0].id, username, name, role: "admin" };
+  res.json({ user: req.session.user });
+}));
+
+app.post("/api/auth/login", asyncRoute(async (req, res) => {
+  const username = clean(req.body.username, 80);
+  const password = String(req.body.password || "");
+  const role = req.body.role === "admin" ? "admin" : "student";
+
+  const r = await pool.query(
+    "SELECT id,username,name,class_name,password_hash,role,active FROM users WHERE username=$1 AND role=$2",
+    [username, role]
+  );
+  const user = r.rows[0];
+
+  if (!user || !user.active || !(await bcrypt.compare(password, user.password_hash))) {
+    return res.status(401).json({ error: "Invalid login details." });
+  }
+
+  req.session.user = {
+    id: user.id,
+    username: user.username,
+    name: user.name,
+    className: user.class_name,
+    role: user.role
+  };
+  res.json({ user: req.session.user });
+}));
+
+app.post("/api/auth/logout", (req, res) => {
+  req.session.destroy(() => res.json({ ok: true }));
+});
+
+app.get("/api/me", (req, res) => {
+  res.json({ user: req.session.user || null });
+});
+
+app.post("/api/reports", requireRole("student"), asyncRoute(async (req, res) => {
+  const category = clean(req.body.category, 80);
+  const title = clean(req.body.title, 160);
+  const description = clean(req.body.description, 5000);
+  const allowed = ["Dewan Makan", "Luahan Perasaan", "Cadangan", "Laporan Pelajar", "Isu Sekolah"];
+
+  if (!allowed.includes(category) || !title || description.length < 5) {
+    return res.status(400).json({ error: "Please complete the report correctly." });
+  }
+
+  const result = await pool.query(
+    "INSERT INTO reports (student_id,category,title,description) VALUES ($1,$2,$3,$4) RETURNING id",
+    [req.session.user.id, category, title, description]
+  );
+
+  res.status(201).json({ id: result.rows[0].id });
+}));
+
+app.get("/api/reports/my", requireRole("student"), asyncRoute(async (req, res) => {
+  const r = await pool.query(`
+    SELECT id, category, title, description, status, admin_response, created_at, updated_at
+    FROM reports WHERE student_id=$1 ORDER BY id DESC
+  `, [req.session.user.id]);
+  res.json({ reports: r.rows });
+}));
+
+app.get("/api/admin/reports", requireRole("admin"), asyncRoute(async (req, res) => {
+  const r = await pool.query(`
+    SELECT r.id, r.category, r.title, r.description, r.status, r.admin_response,
+           r.created_at, r.updated_at,
+           u.id AS student_id, u.username AS student_username, u.name AS student_name,
+           u.class_name
+    FROM reports r
+    JOIN users u ON u.id=r.student_id
+    ORDER BY r.id DESC
+  `);
+  res.json({ reports: r.rows });
+}));
+
+app.patch("/api/admin/reports/:id", requireRole("admin"), asyncRoute(async (req, res) => {
+  const status = clean(req.body.status, 30);
+  const response = clean(req.body.adminResponse, 5000);
+  const allowed = ["Pending", "In Review", "Resolved", "Closed"];
+  if (!allowed.includes(status)) return res.status(400).json({ error: "Invalid status." });
+
+  const result = await pool.query(`
+    UPDATE reports SET status=$1, admin_response=$2, updated_at=NOW() WHERE id=$3
+  `, [status, response, req.params.id]);
+
+  if (!result.rowCount) return res.status(404).json({ error: "Report not found." });
+  res.json({ ok: true });
+}));
+
+app.get("/api/admin/students", requireRole("admin"), asyncRoute(async (req, res) => {
+  const r = await pool.query(`
+    SELECT id, username, name, class_name, active, created_at, nfc_uid
+    FROM users WHERE role='student' ORDER BY name COLLATE "C"
+  `);
+  res.json({ students: r.rows });
+}));
+
+app.post("/api/admin/students", requireRole("admin"), asyncRoute(async (req, res) => {
+  const username = clean(req.body.username, 80);
+  const name = clean(req.body.name, 120);
+  const className = clean(req.body.className, 80);
+  const password = String(req.body.password || "");
+
+  if (!username || !name || password.length < 10) {
+    return res.status(400).json({ error: "Name, username and a password of at least 10 characters are required." });
+  }
+
+  try {
+    const hash = await bcrypt.hash(password, 12);
+    const result = await pool.query(`
+      INSERT INTO users (username,name,class_name,password_hash,role)
+      VALUES ($1,$2,$3,$4,'student') RETURNING id
+    `, [username, name, className, hash]);
+    res.status(201).json({ id: result.rows[0].id });
+  } catch {
+    res.status(409).json({ error: "That student username already exists." });
+  }
+}));
+
+app.patch("/api/admin/students/:id/status", requireRole("admin"), asyncRoute(async (req, res) => {
+  const active = req.body.active ? 1 : 0;
+  const result = await pool.query(
+    "UPDATE users SET active=$1 WHERE id=$2 AND role='student'",
+    [active, req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: "Student not found." });
+  res.json({ ok: true });
+}));
+
+// Admin: assign / change the NFC card UID linked to a student.
+app.post("/api/admin/students/:id/nfc", requireRole("admin"), asyncRoute(async (req, res) => {
+  const uid = clean(req.body.uid, 64).toUpperCase();
+  if (!uid) return res.status(400).json({ error: "Card UID is required." });
+
+  try {
+    const result = await pool.query(
+      "UPDATE users SET nfc_uid=$1 WHERE id=$2 AND role='student' RETURNING id, name",
+      [uid, req.params.id]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: "Student not found." });
+    res.json({ ok: true, student: result.rows[0] });
+  } catch {
+    res.status(409).json({ error: "That card is already linked to another student." });
+  }
+}));
+
+// Admin: remove a card from a student (e.g. lost card).
+app.delete("/api/admin/students/:id/nfc", requireRole("admin"), asyncRoute(async (req, res) => {
+  const result = await pool.query(
+    "UPDATE users SET nfc_uid=NULL WHERE id=$1 AND role='student' RETURNING id",
+    [req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: "Student not found." });
+  res.json({ ok: true });
+}));
+
+// Device endpoint: the ESP32/RC522 reader at the counseling room calls this on every tap.
+// Auth is a shared device key (header), NOT a student/admin session — the device can't log in.
+app.post("/api/nfc/tap", asyncRoute(async (req, res) => {
+  const deviceKey = req.get("X-Device-Key") || "";
+  if (!NFC_DEVICE_KEY || deviceKey !== NFC_DEVICE_KEY) {
+    return res.status(401).json({ error: "Invalid device key." });
+  }
+
+  const uid = clean(req.body.uid, 64).toUpperCase();
+  const deviceId = clean(req.body.deviceId, 64);
+  if (!uid) return res.status(400).json({ error: "Missing card UID." });
+
+  const student = (await pool.query(
+    "SELECT id, name, class_name FROM users WHERE nfc_uid=$1 AND role='student' AND active=1",
+    [uid]
+  )).rows[0];
+
+  if (!student) {
+    // Card not recognized — still return 200 so the reader can show "unknown card" without erroring.
+    return res.json({ recognized: false });
+  }
+
+  // Elak rekod berganda jika kad ditap berkali-kali dalam masa singkat.
+  const recent = await pool.query(
+    "SELECT 1 FROM counseling_visits WHERE student_id=$1 AND tapped_at > NOW() - INTERVAL '60 seconds' LIMIT 1",
+    [student.id]
+  );
+  if (recent.rowCount) {
+    return res.json({ recognized: true, duplicate: true, student: { name: student.name, className: student.class_name } });
+  }
+
+  await pool.query(
+    "INSERT INTO counseling_visits (student_id, device_id) VALUES ($1,$2)",
+    [student.id, deviceId || null]
+  );
+
+  res.json({ recognized: true, duplicate: false, student: { name: student.name, className: student.class_name } });
+}));
+
+// Admin: senarai pelajar yang hadir ke UBK pada tarikh tertentu (waktu Malaysia).
+app.get("/api/admin/counseling/visits", requireRole("admin"), asyncRoute(async (req, res) => {
+  const date = DATE_RE.test(req.query.date || "") ? req.query.date : todayKL();
+
+  const r = await pool.query(`
+    SELECT cv.id, cv.tapped_at, cv.device_id, cv.note,
+           u.id AS student_id, u.name, u.class_name
+    FROM counseling_visits cv
+    JOIN users u ON u.id = cv.student_id
+    WHERE (cv.tapped_at AT TIME ZONE $2)::date = $1::date
+    ORDER BY cv.tapped_at DESC
+  `, [date, TZ]);
+
+  res.json({ date, visits: r.rows });
+}));
+
+// Admin: tambah lawatan secara manual (contoh: pelajar lupa bawa kad).
+app.post("/api/admin/counseling/visits", requireRole("admin"), asyncRoute(async (req, res) => {
+  const studentId = Number(req.body.studentId);
+  const note = clean(req.body.note, 1000);
+  const date = clean(req.body.date, 10);
+  const time = clean(req.body.time, 5);
+  if (!Number.isInteger(studentId)) return res.status(400).json({ error: "Pilih pelajar." });
+
+  const exists = await pool.query("SELECT 1 FROM users WHERE id=$1 AND role='student'", [studentId]);
+  if (!exists.rowCount) return res.status(404).json({ error: "Pelajar tidak dijumpai." });
+
+  const useCustom = DATE_RE.test(date) && /^\d{2}:\d{2}$/.test(time);
+  const result = useCustom
+    ? await pool.query(
+        "INSERT INTO counseling_visits (student_id, device_id, note, tapped_at) VALUES ($1,'manual',$2,(($3 || ' ' || $4)::timestamp AT TIME ZONE $5)) RETURNING id",
+        [studentId, note || null, date, time, TZ]
+      )
+    : await pool.query(
+        "INSERT INTO counseling_visits (student_id, device_id, note) VALUES ($1,'manual',$2) RETURNING id",
+        [studentId, note || null]
+      );
+  res.status(201).json({ id: result.rows[0].id });
+}));
+
+// Admin: kemas kini catatan lawatan.
+app.patch("/api/admin/counseling/visits/:id", requireRole("admin"), asyncRoute(async (req, res) => {
+  const note = clean(req.body.note, 1000);
+  const result = await pool.query("UPDATE counseling_visits SET note=$1 WHERE id=$2", [note || null, req.params.id]);
+  if (!result.rowCount) return res.status(404).json({ error: "Rekod tidak dijumpai." });
+  res.json({ ok: true });
+}));
+
+// Admin: padam rekod lawatan (contoh: tap tersilap).
+app.delete("/api/admin/counseling/visits/:id", requireRole("admin"), asyncRoute(async (req, res) => {
+  const result = await pool.query("DELETE FROM counseling_visits WHERE id=$1", [req.params.id]);
+  if (!result.rowCount) return res.status(404).json({ error: "Rekod tidak dijumpai." });
+  res.json({ ok: true });
+}));
+
+// Pelajar: sejarah lawatan sendiri ke UBK (catatan kaunselor TIDAK dipaparkan).
+app.get("/api/visits/my", requireRole("student"), asyncRoute(async (req, res) => {
+  const r = await pool.query(
+    "SELECT id, tapped_at FROM counseling_visits WHERE student_id=$1 ORDER BY tapped_at DESC LIMIT 90",
+    [req.session.user.id]
+  );
+  const t = await pool.query(`
+    SELECT COUNT(*)::int AS total,
+           COUNT(*) FILTER (
+             WHERE (tapped_at AT TIME ZONE $2) >= date_trunc('month', NOW() AT TIME ZONE $2)
+           )::int AS this_month
+    FROM counseling_visits WHERE student_id=$1
+  `, [req.session.user.id, TZ]);
+  res.json({ visits: r.rows, summary: { total: t.rows[0].total, thisMonth: t.rows[0].this_month } });
+}));
+
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: "Server error." });
+});
+
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`SuaraSahut running at http://localhost:${PORT}`);
+    });
+  })
+  .catch((e) => {
+    console.error("Failed to initialize database:", e);
+    process.exit(1);
+  });
