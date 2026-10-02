@@ -399,14 +399,7 @@ app.post("/api/nfc/tap", asyncRoute(async (req, res) => {
     alreadyToday: !ins.rows.length,
     student: { name: student.name, className: student.class_name }
   });
-  }
-
-  await pool.query(
-    "INSERT INTO counseling_visits (student_id, device_id) VALUES ($1,$2)",
-    [student.id, deviceId || null]
-  );
-
-  res.json({ recognized: true, student: { name: student.name, className: student.class_name } });
+    
 }));
 
 // Admin: view counseling room visit log for a given date (defaults to today).
