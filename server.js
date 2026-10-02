@@ -382,14 +382,16 @@ app.post("/api/nfc/tap", asyncRoute(async (req, res) => {
   const deviceId = clean(req.body.deviceId, 64);
   if (!uid) return res.status(400).json({ error: "Missing card UID." });
 
-  const student = (await pool.query(
-    "SELECT id, name, class_name FROM users WHERE nfc_uid=$1 AND role='student' AND active=1",
-    [uid]
-  )).rows[0];
+   const ins = await pool.query(
+    "INSERT INTO counseling_visits (student_id, device_id) VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING id",
+    [student.id, deviceId || null]
+  );
 
-  if (!student) {
-    // Card not recognized — still return 200 so the reader can show "unknown card" without erroring.
-    return res.json({ recognized: false });
+  res.json({
+    recognized: true,
+    alreadyToday: !ins.rows.length,
+    student: { name: student.name, className: student.class_name }
+  });
   }
 
   await pool.query(
