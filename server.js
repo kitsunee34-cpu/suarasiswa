@@ -56,19 +56,6 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_reports_student ON reports(student_id);
     CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status);
 
-    CREATE TABLE IF NOT EXISTS attendance (
-      id SERIAL PRIMARY KEY,
-      student_id INTEGER NOT NULL REFERENCES users(id),
-      date TEXT NOT NULL,
-      status TEXT NOT NULL CHECK(status IN ('Hadir','Tidak Hadir','Lewat','Cuti')),
-      marked_by INTEGER,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE(student_id, date)
-    );
-    CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date);
-    CREATE INDEX IF NOT EXISTS idx_attendance_student ON attendance(student_id);
-
     ALTER TABLE users ADD COLUMN IF NOT EXISTS nfc_uid TEXT UNIQUE;
 
     CREATE TABLE IF NOT EXISTS counseling_visits (
@@ -123,7 +110,10 @@ function asyncRoute(fn) {
 }
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const ATTENDANCE_STATUSES = ["Hadir", "Tidak Hadir", "Lewat", "Cuti"];
+const TZ = "Asia/Kuala_Lumpur";
+function todayKL() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+}
 
 app.get("/api/setup/status", asyncRoute(async (req, res) => {
   const r = await pool.query("SELECT COUNT(*)::int AS count FROM users WHERE role='admin'");
@@ -239,7 +229,7 @@ app.patch("/api/admin/reports/:id", requireRole("admin"), asyncRoute(async (req,
 
 app.get("/api/admin/students", requireRole("admin"), asyncRoute(async (req, res) => {
   const r = await pool.query(`
-    SELECT id, username, name, class_name, active, created_at
+    SELECT id, username, name, class_name, active, created_at, nfc_uid
     FROM users WHERE role='student' ORDER BY name COLLATE "C"
   `);
   res.json({ students: r.rows });
@@ -275,72 +265,6 @@ app.patch("/api/admin/students/:id/status", requireRole("admin"), asyncRoute(asy
   );
   if (!result.rowCount) return res.status(404).json({ error: "Student not found." });
   res.json({ ok: true });
-}));
-
-app.get("/api/admin/attendance/:date", requireRole("admin"), asyncRoute(async (req, res) => {
-  const date = clean(req.params.date, 10);
-  if (!DATE_RE.test(date)) return res.status(400).json({ error: "Invalid date." });
-
-  const r = await pool.query(`
-    SELECT u.id, u.username, u.name, u.class_name, a.status
-    FROM users u
-    LEFT JOIN attendance a ON a.student_id = u.id AND a.date = $1
-    WHERE u.role='student' AND u.active=1
-    ORDER BY u.class_name COLLATE "C", u.name COLLATE "C"
-  `, [date]);
-
-  res.json({ date, students: r.rows });
-}));
-
-app.post("/api/admin/attendance", requireRole("admin"), asyncRoute(async (req, res) => {
-  const date = clean(req.body.date, 10);
-  const records = Array.isArray(req.body.records) ? req.body.records : [];
-  if (!DATE_RE.test(date)) return res.status(400).json({ error: "Invalid date." });
-  if (!records.length) return res.status(400).json({ error: "No attendance records provided." });
-
-  for (const rec of records) {
-    if (!Number.isInteger(rec.studentId) || !ATTENDANCE_STATUSES.includes(rec.status)) {
-      return res.status(400).json({ error: "Invalid attendance record." });
-    }
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    for (const rec of records) {
-      await client.query(`
-        INSERT INTO attendance (student_id, date, status, marked_by)
-        VALUES ($1,$2,$3,$4)
-        ON CONFLICT (student_id, date) DO UPDATE SET
-          status=EXCLUDED.status, marked_by=EXCLUDED.marked_by, updated_at=NOW()
-      `, [rec.studentId, date, rec.status, req.session.user.id]);
-    }
-    await client.query("COMMIT");
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
-  }
-
-  res.json({ ok: true, count: records.length });
-}));
-
-app.get("/api/attendance/my", requireRole("student"), asyncRoute(async (req, res) => {
-  const r = await pool.query(`
-    SELECT date, status FROM attendance WHERE student_id=$1 ORDER BY date DESC LIMIT 90
-  `, [req.session.user.id]);
-  const records = r.rows;
-
-  const counts = { Hadir: 0, "Tidak Hadir": 0, Lewat: 0, Cuti: 0 };
-  for (const row of records) counts[row.status] = (counts[row.status] || 0) + 1;
-  const marked = records.length;
-  const percent = marked ? Math.round((counts.Hadir / marked) * 100) : 0;
-
-  res.json({
-    records,
-    summary: { percent, hadir: counts.Hadir, takHadir: counts["Tidak Hadir"], lewat: counts.Lewat, cuti: counts.Cuti }
-  });
 }));
 
 // Admin: assign / change the NFC card UID linked to a student.
@@ -381,40 +305,103 @@ app.post("/api/nfc/tap", asyncRoute(async (req, res) => {
   const uid = clean(req.body.uid, 64).toUpperCase();
   const deviceId = clean(req.body.deviceId, 64);
   if (!uid) return res.status(400).json({ error: "Missing card UID." });
+
   const student = (await pool.query(
     "SELECT id, name, class_name FROM users WHERE nfc_uid=$1 AND role='student' AND active=1",
     [uid]
   )).rows[0];
 
   if (!student) {
+    // Card not recognized — still return 200 so the reader can show "unknown card" without erroring.
     return res.json({ recognized: false });
   }
-   const ins = await pool.query(
-    "INSERT INTO counseling_visits (student_id, device_id) VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING id",
+
+  // Elak rekod berganda jika kad ditap berkali-kali dalam masa singkat.
+  const recent = await pool.query(
+    "SELECT 1 FROM counseling_visits WHERE student_id=$1 AND tapped_at > NOW() - INTERVAL '60 seconds' LIMIT 1",
+    [student.id]
+  );
+  if (recent.rowCount) {
+    return res.json({ recognized: true, duplicate: true, student: { name: student.name, className: student.class_name } });
+  }
+
+  await pool.query(
+    "INSERT INTO counseling_visits (student_id, device_id) VALUES ($1,$2)",
     [student.id, deviceId || null]
   );
 
-  res.json({
-    recognized: true,
-    alreadyToday: !ins.rows.length,
-    student: { name: student.name, className: student.class_name }
-  });
-    
+  res.json({ recognized: true, duplicate: false, student: { name: student.name, className: student.class_name } });
 }));
 
-// Admin: view counseling room visit log for a given date (defaults to today).
+// Admin: senarai pelajar yang hadir ke UBK pada tarikh tertentu (waktu Malaysia).
 app.get("/api/admin/counseling/visits", requireRole("admin"), asyncRoute(async (req, res) => {
-  const date = DATE_RE.test(req.query.date || "") ? req.query.date : new Date().toISOString().slice(0, 10);
+  const date = DATE_RE.test(req.query.date || "") ? req.query.date : todayKL();
 
   const r = await pool.query(`
-    SELECT cv.id, cv.tapped_at, cv.device_id, u.id AS student_id, u.name, u.class_name
+    SELECT cv.id, cv.tapped_at, cv.device_id, cv.note,
+           u.id AS student_id, u.name, u.class_name
     FROM counseling_visits cv
     JOIN users u ON u.id = cv.student_id
-    WHERE cv.tapped_at::date = $1::date
+    WHERE (cv.tapped_at AT TIME ZONE $2)::date = $1::date
     ORDER BY cv.tapped_at DESC
-  `, [date]);
+  `, [date, TZ]);
 
   res.json({ date, visits: r.rows });
+}));
+
+// Admin: tambah lawatan secara manual (contoh: pelajar lupa bawa kad).
+app.post("/api/admin/counseling/visits", requireRole("admin"), asyncRoute(async (req, res) => {
+  const studentId = Number(req.body.studentId);
+  const note = clean(req.body.note, 1000);
+  const date = clean(req.body.date, 10);
+  const time = clean(req.body.time, 5);
+  if (!Number.isInteger(studentId)) return res.status(400).json({ error: "Pilih pelajar." });
+
+  const exists = await pool.query("SELECT 1 FROM users WHERE id=$1 AND role='student'", [studentId]);
+  if (!exists.rowCount) return res.status(404).json({ error: "Pelajar tidak dijumpai." });
+
+  const useCustom = DATE_RE.test(date) && /^\d{2}:\d{2}$/.test(time);
+  const result = useCustom
+    ? await pool.query(
+        "INSERT INTO counseling_visits (student_id, device_id, note, tapped_at) VALUES ($1,'manual',$2,(($3 || ' ' || $4)::timestamp AT TIME ZONE $5)) RETURNING id",
+        [studentId, note || null, date, time, TZ]
+      )
+    : await pool.query(
+        "INSERT INTO counseling_visits (student_id, device_id, note) VALUES ($1,'manual',$2) RETURNING id",
+        [studentId, note || null]
+      );
+  res.status(201).json({ id: result.rows[0].id });
+}));
+
+// Admin: kemas kini catatan lawatan.
+app.patch("/api/admin/counseling/visits/:id", requireRole("admin"), asyncRoute(async (req, res) => {
+  const note = clean(req.body.note, 1000);
+  const result = await pool.query("UPDATE counseling_visits SET note=$1 WHERE id=$2", [note || null, req.params.id]);
+  if (!result.rowCount) return res.status(404).json({ error: "Rekod tidak dijumpai." });
+  res.json({ ok: true });
+}));
+
+// Admin: padam rekod lawatan (contoh: tap tersilap).
+app.delete("/api/admin/counseling/visits/:id", requireRole("admin"), asyncRoute(async (req, res) => {
+  const result = await pool.query("DELETE FROM counseling_visits WHERE id=$1", [req.params.id]);
+  if (!result.rowCount) return res.status(404).json({ error: "Rekod tidak dijumpai." });
+  res.json({ ok: true });
+}));
+
+// Pelajar: sejarah lawatan sendiri ke UBK (catatan kaunselor TIDAK dipaparkan).
+app.get("/api/visits/my", requireRole("student"), asyncRoute(async (req, res) => {
+  const r = await pool.query(
+    "SELECT id, tapped_at FROM counseling_visits WHERE student_id=$1 ORDER BY tapped_at DESC LIMIT 90",
+    [req.session.user.id]
+  );
+  const t = await pool.query(`
+    SELECT COUNT(*)::int AS total,
+           COUNT(*) FILTER (
+             WHERE (tapped_at AT TIME ZONE $2) >= date_trunc('month', NOW() AT TIME ZONE $2)
+           )::int AS this_month
+    FROM counseling_visits WHERE student_id=$1
+  `, [req.session.user.id, TZ]);
+  res.json({ visits: r.rows, summary: { total: t.rows[0].total, thisMonth: t.rows[0].this_month } });
 }));
 
 app.get("*", (req, res) => {
